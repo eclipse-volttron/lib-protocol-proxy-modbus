@@ -1,6 +1,7 @@
 """Tests for the ModbusProxy IPC endpoints and the JSON response serializer."""
 import asyncio
 import json
+from types import SimpleNamespace
 from enum import Enum
 from uuid import uuid4
 
@@ -10,6 +11,9 @@ from protocol_proxy.protocol.modbus import json as modbus_json
 from protocol_proxy.protocol.modbus.modbus_proxy import ModbusProxy
 
 from conftest import FakeDevice, FakeResponse, SAMPLE_REGISTERS
+from pathlib import Path as _Path
+from protocol_proxy.manifest import Manifest as _Manifest
+_MANIFEST = _Path(__file__).parents[1] / 'src' / 'protocol_proxy' / 'protocol' / 'modbus' / 'proxy.toml'   # the identity rule lives here now
 
 DEVICE = dict(device_address='10.0.0.4', device_type='tcp', port=1502)
 CLIENT_KEY = 'tcp:10.0.0.4:1502'
@@ -50,14 +54,18 @@ def make_proxy():
                        registration_timeout=0.05)
 
 
-async def call(proxy, name, **message):
-    """Invoke an endpoint the way the IPC layer would after authenticating the caller, and decode its reply."""
+REMOTE = uuid4()      # the caller's remote id, carried in every header
+
+
+async def call(proxy, name, remote=REMOTE, **message):
+    """Invoke an endpoint the way the IPC layer would after authenticating the caller, and decode its reply.
+    ``remote`` is the header's remote id, which is how the proxy knows which device and unit a request concerns."""
     endpoint = {'REGISTER_DEVICE': proxy.register_device_endpoint,
                 'CONFIGURE_REGISTERS': proxy.configure_registers_endpoint,
                 'READ_REGISTERS': proxy.read_registers_endpoint,
                 'WRITE_REGISTERS': proxy.write_registers_endpoint}[name]
     inner = endpoint.__wrapped__                     # skip the @callback peer-authentication wrapper
-    reply = await inner(proxy, None, json.dumps(message).encode('utf8'))
+    reply = await inner(proxy, SimpleNamespace(remote_id=remote), json.dumps(message).encode('utf8'))
     return None if reply is None else json.loads(reply)
 
 
@@ -156,8 +164,8 @@ def test_read_and_write_endpoints():
         reply = await call(proxy, 'WRITE_REGISTERS', **DEVICE, queries=[[1010, 1, [5]]])
         assert reply == {'result': [{'address': 1010, 'count': 1}], 'error': [None]}
 
-        assert await call(proxy, 'READ_REGISTERS', device_address='9.9.9.9', device_type='tcp') is None
-        assert await call(proxy, 'WRITE_REGISTERS', device_address='9.9.9.9', device_type='tcp', queries=[]) is None
+        assert await call(proxy, 'READ_REGISTERS', remote=uuid4()) is None                      # unregistered remote
+        assert await call(proxy, 'WRITE_REGISTERS', remote=uuid4(), queries=[]) is None
     asyncio.run(main())
 
 
@@ -172,8 +180,9 @@ def test_get_client_key_includes_transport():
 
 def test_unique_remote_id_is_passed_through():
     """The manager uses this to decide whether to launch a new process; callers pass a constant, or add a group."""
-    assert ModbusProxy.get_unique_remote_id(('modbus',)) == ('modbus',)
-    assert ModbusProxy.get_unique_remote_id(['modbus', 'plant-b']) == ('modbus', 'plant-b')
+    manifest = _Manifest.load(_MANIFEST)
+    assert manifest.process_key(('modbus',), {}) == ('modbus',)
+    assert manifest.process_key(['modbus', 'plant-b'], {}) == ('modbus', 'plant-b')
 
 
 def test_proxy_launches_through_generic_entry_point_without_options():
@@ -183,3 +192,51 @@ def test_proxy_launches_through_generic_entry_point_without_options():
     assert package.PROXY_CLASS is ModbusProxy
     parser, runner = resolve_launcher('protocol_proxy.protocol.modbus.modbus_proxy:ModbusProxy')(proxy_command_parser())
     assert {a.dest for a in parser._actions} == {a.dest for a in proxy_command_parser()._actions}   # nothing added
+
+
+def test_remote_id_in_the_header_identifies_the_client_and_unit(monkeypatch):
+    """A version 2 caller registers once with its connection details; later requests carry only the request."""
+    async def main():
+        proxy = make_proxy()
+        created = {}
+
+        class FakeClient:
+            def __init__(self):
+                self.calls = []
+
+            def configure_registers(self, tables, **kwargs):
+                return {'configured': {t: {'specs': len(v)} for t, v in tables.items()}}
+
+            async def read(self, queries, register_map, unit_id, decode=False, **kwargs):
+                self.calls.append(('read', queries, register_map, unit_id, decode, kwargs))
+                return {'results': {'1': 7}, 'errors': {}}
+
+            async def write(self, queries, register_map, unit_id, encode=False, **kwargs):
+                self.calls.append(('write', queries, register_map, unit_id, encode, kwargs))
+                return {'results': [None], 'errors': [None]}
+
+        async def create(device_address, transport_protocol, **kwargs):
+            created['args'] = (device_address, transport_protocol, kwargs)
+            return FakeClient()
+        from protocol_proxy.protocol.modbus import modbus_proxy
+        monkeypatch.setattr(modbus_proxy.ModbusClient, 'create', staticmethod(create))
+        remote_a, remote_b = uuid4(), uuid4()
+        reply = await call(proxy, 'REGISTER_DEVICE', remote=remote_a, device_address='10.0.0.4', device_type='tcp', port=502,
+                           unit_id=3, tables={'holding': [{'address': 1, 'data_type': 'UINT16', 'count': 1}]})
+        assert reply['error'] == {} and proxy.remotes[remote_a] == ('tcp:10.0.0.4:502', 3)
+        reply = await call(proxy, 'REGISTER_DEVICE', remote=remote_b, device_address='10.0.0.4', device_type='tcp', port=502, unit_id=4)
+        assert proxy.remotes[remote_b] == ('tcp:10.0.0.4:502', 4) and len(proxy.clients) == 1        # one gateway connection
+        client = proxy.clients['tcp:10.0.0.4:502']
+        reply = await call(proxy, 'READ_REGISTERS', remote=remote_a, queries=[[1, 1]], register_map='holding', decode=True)
+        assert reply['result'] == {'1': 7} and client.calls[-1][:4] == ('read', [[1, 1]], 'holding', 3)
+        await call(proxy, 'WRITE_REGISTERS', remote=remote_b, queries=[[1, None, 5]], register_map='holding', encode=True)
+        assert client.calls[-1][:4] == ('write', [[1, None, 5]], 'holding', 4)
+        await call(proxy, 'READ_REGISTERS', remote=remote_b, queries=[[1, 1]], unit_id=9)       # a payload unit id overrides
+        assert client.calls[-1][3] == 9
+        assert await call(proxy, 'READ_REGISTERS', remote=uuid4(), queries=[[1, 1]]) is None   # unknown remote
+        # Payload identity fields are not a substitute for the header, and are not passed on as request options.
+        assert await call(proxy, 'READ_REGISTERS', remote=uuid4(), device_address='10.0.0.4', device_type='tcp', port=502,
+                          queries=[[1, 1]]) is None
+        reply = await call(proxy, 'REGISTER_DEVICE', remote=None, device_address='10.0.0.4', device_type='tcp', port=502)
+        assert 'remote id' in reply['error']['device']
+    asyncio.run(main())

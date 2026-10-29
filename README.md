@@ -45,7 +45,7 @@ The Modbus proxy takes no protocol-specific launch options. Everything about a d
 
 | Message | Purpose |
 |---|---|
-| `REGISTER_DEVICE` | Create (or reuse) the client for a gateway. Carries `device_address`, `device_type` (`tcp`, `udp`, `tls`, `serial`), `port`, and pymodbus client options (`timeout`, `retries`, serial settings). May also carry the `CONFIGURE_REGISTERS` fields to declare the register map in the same round trip. |
+| `REGISTER_DEVICE` | Create (or reuse) the client for a gateway and remember the caller's remote id (protocol-proxy header version 2) with the client and `unit_id`, which is how the caller's later reads, writes and register configuration name them. Carries `device_address`, `device_type` (`tcp`, `udp`, `tls`, `serial`), `port`, and pymodbus client options (`timeout`, `retries`, serial settings). May also carry the `CONFIGURE_REGISTERS` fields to declare the register map in the same round trip. |
 | `CONFIGURE_REGISTERS` | Declare the data types of the registers on one unit: `unit_id`, `tables`, optional `max_gap` and `clear_others`. Listed tables are replaced whole; others are kept unless `clear_others` is true. The build is atomic: one bad entry rejects the whole message and leaves the current map untouched. |
 | `READ_REGISTERS` | Read from one table (`register_map`) on one unit. `queries` are `[start, count]` pairs. With `decode` true, values are decoded using the declared data types and returned keyed by address; omit `queries` to read the whole table in the fewest requests. |
 | `WRITE_REGISTERS` | Write to one table on one unit. `queries` are `[start, count, values]`. With `encode` true, `values` is the Python value for the point at `start` and is encoded using the declared data type. |
@@ -76,6 +76,29 @@ A `tables` block maps a table name to a list of register specifications:
   specification may also carry `count`, `word_order` (`big` or `little`), and `string_encoding`.
 - **Pads** are registers that are read but never decoded or returned. Two points separated by a pad are fetched in one
   request. `max_gap` lets the proxy read through short unconfigured gaps as well.
+
+## Slave role
+
+A registration whose `role` is `slave` (or `server`) makes the proxy *serve* a Modbus unit instead of reaching one. The
+endpoint is named by `transport_protocol`: `tcp` (the default), `udp` or `tls` listen on `bind_host:port` (`tls` with the
+server certificate `cert_path`/`key_path` and, with `client_auth`, the `ca_path` the masters' certificates are checked
+against); `serial` serves on the port `device_address` with `baudrate`, `bytesize`, `parity` and `stopbits`. Units
+registered on the same endpoint share one listener (a gateway-style device, or several units on one serial line); the
+listener is rebuilt when a unit is added, changed or closed, keeping the values of the points that stay, and stops with
+its last unit. Requests for a unit the listener does not serve are answered ILLEGAL DATA ADDRESS.
+
+Each unit's four register tables hold its registered points. The `tables` block is the same as above, with each row also
+naming its `topic`, whether the master may write it (`remote_writable`; coils and holding registers by default, never
+inputs or pads) and an `initial_value`. Each table is served as one block covering its configured addresses; reads
+outside it, and writes to pads, to unregistered registers or to points that are not remote-writable, are answered with
+ILLEGAL DATA ADDRESS.
+
+Reads and writes to a served unit are keyed by topic: `READ_POINTS` (`topics`) reports the decoded register values,
+`WRITE_POINTS` (`values`) encodes the platform's values into the registers (any table, including inputs: they are the
+telemetry the unit serves). The master's accepted writes are decoded and pushed as `RECEIVE_WRITES`, tagged with the
+caller's remote id. On (re)registration the proxy pushes every point that holds a value; registration `values` (the
+caller's current values) seed points nothing has written, ahead of their `initial_value`. Re-registering the same
+listener and unit rebuilds the tables and keeps the values of points that stay. `CLOSE_REMOTE` stops a served unit.
 
 ## Request planning
 
